@@ -54,42 +54,72 @@ class ClassificationNetwork(nn.Module):
     def __init__(self, input_size, n_classes, layers):
         super().__init__()
         self.input_size = input_size
-        self.lin1 = nn.Linear(self.input_size, layers[0])
-        self.lin2 = nn.Linear(layers[0], layers[1])
-        self.lin3 = nn.Linear(layers[1], n_classes)
-        self.bn2 = nn.BatchNorm1d(layers[0])
-        self.bn3 = nn.BatchNorm1d(layers[1])
         self.drops = nn.Dropout(0.3)
+        self.nlayers = len(layers)
+        self.lin1 = nn.Linear(self.input_size, layers[0])
+        self.bn2 = nn.BatchNorm1d(layers[0])
+        if self.nlayers==1:
+            self.lin2 = nn.Linear(layers[0], n_classes)
+        elif self.nlayers==2:
+            self.lin2 = nn.Linear(layers[0], layers[1])
+            self.bn3 = nn.BatchNorm1d(layers[1])
+            self.lin3 = nn.Linear(layers[1], n_classes)
+        elif self.nlayers==3:
+            self.lin2 = nn.Linear(layers[0], layers[1])
+            self.bn3 = nn.BatchNorm1d(layers[1])
+            self.lin3 = nn.Linear(layers[1], layers[2])
+            self.bn4 = nn.BatchNorm1d(layers[2])
+            self.lin4 = nn.Linear(layers[2], n_classes)
+        else:
+            print("number of layers not supported.")
         
     def forward(self, x):
         #x = torch.cat(x, 1)
         x = F.relu(self.lin1(x))
         x = self.drops(x)
         x = self.bn2(x)
+        if self.nlayers==1:
+            return self.lin2(x)
         x = F.relu(self.lin2(x))
         x = self.drops(x)
         x = self.bn3(x)
-        x = self.lin3(x)
-        return x
+        if self.nlayers==2:
+            return self.lin3(x)
+        x = F.relu(self.lin3(x))
+        x = self.drops(x)
+        x = self.bn4(x)
+        return self.lin4(x)
 
 
 class RegressionNetwork(nn.Module):
     def __init__(self, input_size, layers):
         super().__init__()
         self.input_size = input_size
+        self.nlayers = len(layers)
         self.lin1 = nn.Linear(self.input_size, layers[0])
-        self.lin2 = nn.Linear(layers[0], layers[1])
-        self.lin3 = nn.Linear(layers[1], 1)
+        if self.nlayers==1:
+            self.lin2 = nn.Linear(layers[0], 1)
+        elif self.nlayers==2:
+            self.lin2 = nn.Linear(layers[0], layers[1])
+            self.lin3 = nn.Linear(layers[1], 1)
+        elif self.nlayers==3:
+            self.lin2 = nn.Linear(layers[0], layers[1])
+            self.lin3 = nn.Linear(layers[1], layers[2])
+            self.lin4 = nn.Linear(layers[2], 1)
         
     def forward(self, x):
         x = F.relu(self.lin1(x))
+        if self.nlayers==1:
+            return self.lin2(x)
         x = F.relu(self.lin2(x))
-        x = self.lin3(x)
-        return x
+        if self.nlayers==2:
+            return self.lin3(x)
+        x = F.relu(self.lin3(x))
+        return self.lin4(x)
 
-def get_optimizer(model, lr = 0.001, wd = 0.0):
+def get_optimizer(model, opt, lr = 0.001, wd = 0.0):
     parameters = filter(lambda p: p.requires_grad, model.parameters())
-    optim = torch_optim.Adam(parameters, lr=lr, weight_decay=wd)
+    optim = opt(parameters, lr=lr, weight_decay=wd)
     return optim
 
 def train_model(model, c, optim, train_dl, device):
@@ -141,13 +171,13 @@ def val_regression_loss(model, valid_dl, device):
 
 def classification_train_loop(model, optim, epochs, train_dl, valid_dl, device):
     for i in range(epochs): 
-        loss = train_model(model, c=True, optim, train_dl, device)
+        loss = train_model(model, True, optim, train_dl, device)
         val_acc = val_classification_loss(model, valid_dl, device)
     return val_acc
     
 def regression_train_loop(model, optim, epochs, train_dl, valid_dl, device):
     for i in range(epochs): 
-        loss = train_model(model, c=False, optim, train_dl, device)
+        loss = train_model(model, False, optim, train_dl, device)
         val_mse = val_regression_loss(model, valid_dl, device)
     return val_mse
 
@@ -213,16 +243,17 @@ class Evaluator:
             dset.reset_index(drop=True, inplace=True)
         return (X_train, X_val, X_test, y_train, y_val, y_test)
 
-    def successive_halving(self, budget, layers, lrs, train_dl, valid_dl, input_size, n_classes, c):
+    def successive_halving(self, budget, layers, lrs, opts, train_dl, valid_dl, input_size, n_classes, c):
         models = {}
         for layer in layers:
             for lr in lrs:
-                if c:
-                    mod = ClassificationNetwork(input_size,n_classes,layer)
-                else:
-                    mod = RegressionNetwork(input_size,layer)
-                optim = get_optimizer(mod, lr = lr, wd = 0.0000)
-                models[(mod, optim)] = None
+                for opt in opts:
+                    if c:
+                        mod = ClassificationNetwork(input_size,n_classes,layer)
+                    else:
+                        mod = RegressionNetwork(input_size,layer)
+                    optim = get_optimizer(mod, opt, lr = lr, wd = 0.0000)
+                    models[(mod, optim)] = None
         while len(models.keys()) > 1:
             e = int(budget/len(models))
             for model in models.keys():
@@ -235,7 +266,7 @@ class Evaluator:
                 models.pop(min(models, key=models.get))
         return models
 
-    def run_model(self, row, budget, layers, lrs):
+    def run_model(self, row, budget, layers, lrs, opts):
 
         c = row['task'] == "Classification"
 
@@ -250,10 +281,11 @@ class Evaluator:
         test_ds = MyDataset(X_test, y_test)
         test_dl = DataLoader(test_ds, batch_size=batch_size)
 
-        model = self.successive_halving(budget, layers, lrs, train_dl, valid_dl, input_size, n_classes, c)
+        model = self.successive_halving(budget, layers, lrs, opts, train_dl, valid_dl, input_size, n_classes, c)
         k = [i for i in model.keys()][0]
         model = k[0]
         print(model)
+        print(k[1])
 
         model.eval()
 
@@ -293,12 +325,13 @@ def main():
 
     ev = Evaluator(attr, device)
 
-    layers = [(200, 70), (100, 50)]
+    layers = [[100], [200, 70], [100,50], [100,50,50]]
     lrs = [0.001, 0.0005]
+    opts = [torch_optim.AdamW, torch_optim.Adagrad, torch_optim.SGD]
 
     for i in range(len(df)):
         print(df.iloc[i]['name'])
-        ev.run_model(df.iloc[i], 100, layers, lrs)
+        ev.run_model(df.iloc[i], 100, layers, lrs, opts)
         print()
 
 if __name__=="__main__":
