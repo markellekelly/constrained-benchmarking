@@ -16,12 +16,8 @@ import torch.optim as torch_optim
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from datetime import datetime
-
-def flat_accuracy(preds, labels):
-    pred_flat = np.argmax(preds, axis=1).flatten()
-    labels_flat = labels.flatten()
-    return np.sum(pred_flat == labels_flat) / len(labels_flat)
+import time
+import math
 
 def get_device():
 
@@ -29,12 +25,6 @@ def get_device():
         return torch.device("cuda")
 
     return torch.device("cpu")
-
-def to_device(data, device):
-    """Move tensor(s) to chosen device"""
-    if isinstance(data, (list,tuple)):
-        return [to_device(x, device) for x in data]
-    return data.to(device, non_blocking=True)
 
 class MyDataset(Dataset):
     def __init__(self, X, Y):
@@ -74,7 +64,6 @@ class ClassificationNetwork(nn.Module):
             print("number of layers not supported.")
         
     def forward(self, x):
-        #x = torch.cat(x, 1)
         x = F.relu(self.lin1(x))
         x = self.drops(x)
         x = self.bn2(x)
@@ -132,8 +121,8 @@ def train_model(model, c, optim, train_dl, device):
         if c:
             loss = F.cross_entropy(output.float(), y.to(device).long())
         else:
-            y = y.to(device).float().reshape((y.shape[0], 1))
-            loss = F.mse_loss(output, y)
+            y = y.float().reshape((y.shape[0], 1))
+            loss = F.mse_loss(output, y.to(device))
         optim.zero_grad()
         loss.backward()
         optim.step()
@@ -147,44 +136,63 @@ def val_classification_loss(model, valid_dl, device):
     sum_loss = 0
     correct = 0
     for x, y in valid_dl:
-        current_batch_size = y.shape[0]
+        current_batch_size = y.to(device).shape[0]
         out = model(x.to(device))
         loss = F.cross_entropy(out.float(), y.to(device).long())
         sum_loss += current_batch_size*(loss.item())
         total += current_batch_size
         pred = torch.max(out, 1)[1]
-        correct += (pred == y).float().sum().item()
-    return correct/total
+        correct += (pred == y.to(device)).float().sum().item()
+    return sum_loss/total
 
 def val_regression_loss(model, valid_dl, device):
     model.eval()
     total = 0
     mse = 0
+    sum_loss=0
     for x, y in valid_dl:
-        current_batch_size = y.shape[0]
+        current_batch_size = y.to(device).shape[0]
         out = model(x.to(device))
         y = y.to(device).float().reshape((y.shape[0], 1))
         loss = F.mse_loss(out.float(), y)
+        sum_loss += current_batch_size*(loss.item())
         total += current_batch_size
         mse += (y - out).float().sum().item() ** 2
-    return mse/total
+    return sum_loss/total
 
 def classification_train_loop(model, optim, epochs, train_dl, valid_dl, device):
+    if epochs <1:
+        return -1*math.inf
+    losses = []
+    model=model.cuda()
     for i in range(epochs): 
         loss = train_model(model, True, optim, train_dl, device)
-        val_acc = val_classification_loss(model, valid_dl, device)
-    return val_acc
+        val_loss = val_classification_loss(model, valid_dl, device)
+        losses.append(val_loss)
+        if len(losses)>30 and losses[-30] <= val_loss: #early stopping
+            return val_loss
+    return val_loss
     
 def regression_train_loop(model, optim, epochs, train_dl, valid_dl, device):
+    if epochs<1:
+        return math.inf
+    losses = []
+    model=model.cuda()
     for i in range(epochs): 
         loss = train_model(model, False, optim, train_dl, device)
-        val_mse = val_regression_loss(model, valid_dl, device)
-    return val_mse
+        val_loss = val_regression_loss(model, valid_dl, device)
+        losses.append(val_loss)
+        if len(losses)>30 and losses[-30] <= val_loss: #early stopping
+            return val_loss
+    return val_loss
 
 class Evaluator:
-    def __init__(self, attr, device):
+    def __init__(self, attr, device, layers, lrs, opts):
         self.attr = attr
         self.device = device
+        self.layers = layers
+        self.lrs = lrs
+        self.opts = opts
 
     def get_data(self, row):
         fname = row['train_file']
@@ -243,30 +251,92 @@ class Evaluator:
             dset.reset_index(drop=True, inplace=True)
         return (X_train, X_val, X_test, y_train, y_val, y_test)
 
-    def successive_halving(self, budget, layers, lrs, opts, train_dl, valid_dl, input_size, n_classes, c):
+    def choose_n_models(self, input_size, n_classes, c, n):
         models = {}
-        for layer in layers:
-            for lr in lrs:
-                for opt in opts:
+        for i in range(n):
+            layer = self.layers[random.randint(0, len(self.layers)-1)]
+            lr = self.lrs[random.randint(0, len(self.lrs)-1)]
+            opt = self.opts[random.randint(0, len(self.opts)-1)]
+            if c:
+                mod = ClassificationNetwork(input_size,n_classes,layer)
+            else:
+                mod = RegressionNetwork(input_size,layer)
+            optim = get_optimizer(mod, opt, lr = lr, wd = 0.0000)
+            models[(mod, optim)] = None
+        return models
+
+    def enumerate_models(self,input_size, n_classes, c):
+        comp =0; highest_complexity = None
+        models = {}
+        for layer in self.layers:
+            for lr in self.lrs:
+                for opt in self.opts:
                     if c:
                         mod = ClassificationNetwork(input_size,n_classes,layer)
                     else:
                         mod = RegressionNetwork(input_size,layer)
                     optim = get_optimizer(mod, opt, lr = lr, wd = 0.0000)
                     models[(mod, optim)] = None
+                    if len(layer) * max(layer) > comp:
+                        comp = len(layer) * max(layer)
+                        highest_complexity = (mod, optim)
+        return models, highest_complexity
+
+    def choose_budget(self, train_dl, valid_dl, hc, c):
+        t1 = time.time()
+        if c:
+            classification_train_loop(hc[0],hc[1], 1, train_dl, valid_dl, self.device)
+        else:
+            regression_train_loop(hc[0],hc[1], 1, train_dl, valid_dl, self.device)
+        t2 = time.time()
+        return (30*60)/(t2-t1)
+
+    def successive_halving(self, budget, models, train_dl, valid_dl, c):
+        '''jamieson et al. (2015)'''
+        t1 = time.time()
+        n = len(models.keys())
         while len(models.keys()) > 1:
-            e = int(budget/len(models))
+            e = math.floor(budget/(len(models.keys())*math.ceil(math.log(n,2))))
             for model in models.keys():
                 if c:
-                    acc = classification_train_loop(model[0],model[1], e, train_dl, valid_dl, self.device)
+                    acc = -1*classification_train_loop(model[0],model[1], e, train_dl, valid_dl, self.device)
                 else:
                     acc = -1* regression_train_loop(model[0],model[1], e, train_dl, valid_dl, self.device)
                 models[model] = acc
             for i in range(int(len(models.keys())/2)):
                 models.pop(min(models, key=models.get))
+        t2 = time.time()
+        f = open("output.txt", "a");f.write("elapsed time:"+str(t2-t1)+'\n'); f.close()
         return models
 
-    def run_model(self, row, budget, layers, lrs, opts):
+    def hyperband(self, R, train_dl, valid_dl,input_size, n_classes, c, nu=3):
+        '''li et al. (2016)'''
+        t1 =time.time()
+        smax = math.floor(math.log(R,nu))
+        B = R * (smax+1)
+        best_performance=-1*math.inf; best_model=None
+        for s in range(smax,-1,-1):
+            n = math.ceil((B*(nu**s))/(R*(s+1)))
+            r = R*(n**(-1*s))
+            models = self.choose_n_models(input_size, n_classes, c, n)
+            for i in range(0,s+1):
+                ni = math.floor(n*(nu**(-1*i)))
+                ri = int(r*(nu**i))
+            if ri > 0:
+                for model in models.keys():
+                    if c:
+                        acc = classification_train_loop(model[0],model[1], ri, train_dl, valid_dl, self.device)
+                    else:
+                        acc = -1* regression_train_loop(model[0],model[1], ri, train_dl, valid_dl, self.device)
+                    models[model] = acc
+                remove = len(models) - math.floor(ni/nu)
+                for i in range(remove):
+                    models.pop(min(models, key=models.get))
+        t2 = time.time()
+        f = open("output.txt", "a");f.write("elapsed time:"+str(t2-t1)+'\n'); f.close()
+        return models
+
+    def run_model(self, row, HB=False, budget=None):
 
         c = row['task'] == "Classification"
 
@@ -281,36 +351,44 @@ class Evaluator:
         test_ds = MyDataset(X_test, y_test)
         test_dl = DataLoader(test_ds, batch_size=batch_size)
 
-        model = self.successive_halving(budget, layers, lrs, opts, train_dl, valid_dl, input_size, n_classes, c)
+        models,hc=self.enumerate_models(input_size, n_classes, c)
+        if budget is None:
+            budget = self.choose_budget(train_dl, valid_dl, hc, c)
+
+        if HB:
+            model = self.hyperband(budget, train_dl, valid_dl, input_size, n_classes, c)
+        else:
+            model = self.successive_halving(budget, models, train_dl, valid_dl, c)
         k = [i for i in model.keys()][0]
         model = k[0]
-        print(model)
-        print(k[1])
+        f = open("output.txt", "a");f.write(str(model)+'\n');f.write(str(k[1])+'\n'); f.close()
 
         model.eval()
-
+        model = model.cuda()
         total=0; correct=0; mse=0
         with torch.no_grad():
             for x,y in test_dl:
                 out = model(x.to(self.device))
-                total+=y.shape[0]
+                total+=y.to(self.device).shape[0]
                 if c:
                     prob = F.softmax(out, dim=1)
                     pred = torch.max(out, 1)[1]
-                    correct += (pred == y).float().sum().item()
+                    correct += (pred == y.to(self.device)).float().sum().item()
                 else:
                     y = y.to(self.device).float().reshape((y.shape[0], 1))
                     mse += (y-out).float().sum().item() ** 2
 
         if c:
             acc = correct/total
-            print(acc)
+            f = open("output.txt", "a");f.write("accuracy:"+str(acc)+'\n\n'); f.close()
         else:
             mse=mse/total
-            print(mse)
+            f = open("output.txt", "a");f.write("MSE:"+str(mse)+'\n\n'); f.close()
 
 
 def main():
+    f = open("output.txt", "w"); f.write("");f.close()
+    
     device = get_device()
     s=0
     random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
@@ -318,21 +396,19 @@ def main():
     datasets = pd.read_csv('schema_conversion/datasets_update.csv',
                       usecols=["name","old_id", "new_id", "task", "is_tabular"])
     attr = pd.read_csv("schema_conversion/Attributes.csv")
-    tab = pd.read_csv("schema_conversion/datasetTabular.csv")
+    tab = pd.read_csv("schema_conversion/DatasetTabular.csv")
     sub = pd.DataFrame(datasets[['name','is_tabular','task','old_id']])
     sub = sub[sub["is_tabular"]==1]
     df = sub.merge(tab, how='inner',left_on='old_id',right_on='dataset_id').drop('old_id', axis=1)
 
-    ev = Evaluator(attr, device)
-
-    layers = [[100], [200, 70], [100,50], [100,50,50]]
-    lrs = [0.001, 0.0005]
-    opts = [torch_optim.AdamW, torch_optim.Adagrad, torch_optim.SGD]
-
-    for i in range(len(df)):
-        print(df.iloc[i]['name'])
-        ev.run_model(df.iloc[i], 100, layers, lrs, opts)
-        print()
+    layers = [[50],[100],[100,50], [200,100,50]]
+    lrs = [0.0001, 0.0005]
+    opts = [torch_optim.AdamW, torch_optim.SGD]
+    ev = Evaluator(attr, device, layers, lrs, opts)
+   
+    for i in range(10,len(df)):
+        f = open("output.txt", "a");f.write(df.iloc[i]['name']+'\n'); f.close()
+        ev.run_model(df.iloc[i], HB=True)
 
 if __name__=="__main__":
     main()
